@@ -7,28 +7,36 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.{SparkSession, DataFrame, Dataset}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.ml.recommendation.{ALS, ALSModel}
+import org.apache.spark.SparkConf
+import org.apache.spark.storage.StorageLevel
 import org.apache.log4j.{Level, Logger}
-
 
 
 
 object Recommendation {
 
     Logger.getLogger("org").setLevel(Level.WARN)
+    val logg = Logger.getLogger(this.getClass)
 
     def main(args: Array[String]): Unit = {
 
-        val spark = SparkSession.builder().appName("Chapter 3: Recommendation").getOrCreate()
+        logg.warn("This is warn message.")
+        logg.error("This is warn message.")
+
+        val conf = new SparkConf().setMaster("local[2]").setAppName("Chapter 3: Recommendation")
+        // val spark = SparkSession.builder().appName("Chapter 3: Recommendation").getOrCreate()
+        val spark = SparkSession.builder().config(conf=conf).enableHiveSupport().getOrCreate()
+
         spark.sparkContext.setCheckpointDir("hdfs://192.168.2.104:9000/tmp")
         import spark.implicits._
-        println("\n\n==================== Spark Job: Read DataFile ! ====================\n\n")
+        println("\n==================== Spark Job: Read DataFile ! ====================\n")
         val base_dir = "hdfs://192.168.2.104:9000/user/bdhysfas/data/profiledata_06-May-2005/"
         val rawUserArtistData = spark.read.textFile(base_dir + "user_artist_data.txt")
         val rawArtistData = spark.read.textFile(base_dir + "artist_data.txt")
         val rawArtistAlias = spark.read.textFile(base_dir + "artist_alias.txt")
 
         // pre-process stage 1
-        println("\n\n==================== Spark Job: Data Pre-Process ! ====================\n\n")
+        println("\n==================== Spark Job: Data Pre-Process ! ====================\n")
         val userArtistDF = rawUserArtistData.map{ line =>
             val Array(user, artist, _*) = line.split(' ')
             (user.toInt, artist.toInt)
@@ -63,21 +71,21 @@ object Recommendation {
         val runCommendation = new RunCommendation(spark)
         val bArtistAlias = spark.sparkContext.broadcast(artistAlias)
         val trainData = runCommendation.buildCounts( rawUserArtistData, bArtistAlias )
-        trainData.cache()
+        trainData.persist(StorageLevel.MEMORY_AND_DISK_SER)
         trainData.show(5)
 
-        println("\n\n==================== Spark Job: Training Model ! ====================\n\n")
+        println("\n==================== Spark Job: Training Model ! ====================\n")
         runCommendation.model( trainData, bArtistAlias, artistByID )
-        println("\n\n==================== Spark Job: Evaluate Model ! ====================\n\n")
-        runCommendation.evaluate( trainData, bArtistAlias, artistByID )
-        println("\n\n==================== Spark Job: Recommendate for one user with trained Model ! ====================\n\n")
+        // println("\n==================== Spark Job: Evaluate Model ! ====================\n")
+        // runCommendation.evaluate( trainData, bArtistAlias, artistByID )
+        println("\n==================== Spark Job: Recommend for one user with trained Model ! ====================\n")
         val alsModel = runCommendation.recommend( trainData, bArtistAlias, artistByID )
-        println("\n\n==================== Spark Job: Recommendate for some user with trained Model ! ====================\n\n")
+        println("\n==================== Spark Job: Recommend for some users with trained Model ! ====================\n")
         runCommendation.toRecommend(trainData, alsModel )
 
         trainData.unpersist()
         spark.stop()
-        println("\n\n==================== Spark Job Run Successfully! ====================\n\n")
+        println("\n==================== Spark Job Run Successfully! ====================\n")
     }
 }
 
@@ -104,7 +112,7 @@ class RunCommendation(private val spark: SparkSession) {
                 fit(trainData)
         model.userFactors.select("features").show(truncate=false)
 
-        println(s"\n\n-------------------- Spark Job: Recommendate for one user with trained model --------------------\n\n")
+        println(s"\n-------------------- Spark Job: Recommendate for one user with trained model --------------------\n")
         val userID = 2093760
         val existingArtistIDs = trainData.filter($"user" === userID).select("artist").as[Int].collect()
         artistByID.filter( $"id" isin (existingArtistIDs: _*) ).show(5, false)
@@ -126,14 +134,14 @@ class RunCommendation(private val spark: SparkSession) {
 
     def evaluate( allData: DataFrame, bArtistAlias: Broadcast[Map[Int, Int]], artistByID: DataFrame ): Unit = {
         val Array(trainData, cvData) = allData.randomSplit( Array(0.9, 0.1) )
-        trainData.cache()
-        cvData.cache()
+        trainData.persist(StorageLevel.MEMORY_AND_DISK_SER)
+        cvData.persist(StorageLevel.MEMORY_AND_DISK_SER)
 
         val allArtistIDs = allData.select("artist").as[Int].distinct().collect()
         val bAllArtistIDs = spark.sparkContext.broadcast( allArtistIDs )
         // evaluate the most listened algo
         val mostListenedAUC = areaUnderCurve( cvData, bAllArtistIDs, predictMostListened(trainData) )
-        println(s"\n\n-------------------- Most Listened: $mostListenedAUC --------------------\n\n")
+        println(s"\n-------------------- Most Listened AUC: $mostListenedAUC --------------------\n")
 
         val evaluations = 
             for ( rank <- Seq(5, 30); regParam <- Seq(1.0, 0.0001); alpha <- Seq(1.0, 40.0) ) 
@@ -147,11 +155,11 @@ class RunCommendation(private val spark: SparkSession) {
                 model.itemFactors.unpersist()
 
                 ( auc, (rank, regParam, alpha) )
-                println(s"\n\n ---------- auc: $auc, rank: $rank, regParam: $regParam, alpha: $alpha -----------  \n\n")
+                println(s"\n ---------- auc: $auc, rank: $rank, regParam: $regParam, alpha: $alpha -----------  \n")
             }
-        println("\n\n -------------------- start print auc: (rank, regParam, alpha) -------------------- \n\n")
+        println("\n -------------------- start print auc: (rank, regParam, alpha) -------------------- \n")
         evaluations.sorted.reverse.foreach(println)
-        println("\n\n -------------------- end print auc: (rank, regParam, alpha) -------------------- \n\n")
+        println("\n -------------------- end print auc: (rank, regParam, alpha) -------------------- \n")
         trainData.unpersist()
         cvData.unpersist()
 
@@ -205,10 +213,19 @@ class RunCommendation(private val spark: SparkSession) {
             setUserCol("user").setItemCol("artist").setRatingCol("count").setPredictionCol("prediction").
             fit(allData)
         val userID = 2093760
+        println("\n -------------------- Recommend with user-defined makeRecommendation function -------------------- \n")
         val topRecommendations = makeRecommendations(model, userID, 5)
         val recommendedArtistIDs = topRecommendations.select("artist").as[Int].collect()
-
-        artistByID.join( spark.createDataset(recommendedArtistIDs).toDF("id"), "id").select("name").show(5, false)
+        artistByID.join( spark.createDataset(recommendedArtistIDs).toDF("id"), "id" ).select("name").show(5, false)
+        artistByID.filter( $"id" isin (recommendedArtistIDs: _*) ).show(5, false)
+        println("\n -------------------- Recommend with Spark-Owned makeRecommendation function -------------------- \n")
+        val topRecommendation2 = model.recommendForUserSubset( allData.filter($"user" === userID).select("user"), 5 )
+        val recommenedArtists = topRecommendation2.select( explode($"recommendations") ).
+            withColumn("artist", $"col".getField("artist")).withColumn("rating", $"col".getField("rating")).
+            drop("col")
+        val recommendedArtistIDs2 = recommenedArtists.select("artist").as[Int].collect()
+        artistByID.filter( $"id" isin (recommendedArtistIDs2: _*) ).show(5, false)
+        
         model.userFactors.unpersist()
         model.itemFactors.unpersist()
         
@@ -221,7 +238,7 @@ class RunCommendation(private val spark: SparkSession) {
         val someRecommendations = someUsers.map( userID => (userID, makeRecommendations(model, userID, 5)) )
         someRecommendations.foreach { case (userID, recsDF) =>
             val recommendedArtists = recsDF.select("artist").as[Int].collect()
-            println(s"$userID -> ${recommendedArtists.mkString(",")}")
+            println(s"\n$userID -> ${recommendedArtists.mkString(",")}\n")
         }
     }
 }
